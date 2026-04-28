@@ -1,13 +1,13 @@
 import sys
 import threading
 import asyncio
+import time
 from PyQt5.QtWidgets import (
-    QApplication, QLabel, QWidget, QVBoxLayout, QSizePolicy
+    QApplication, QWidget, QVBoxLayout
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QCoreApplication, QObject, pyqtSignal
 from PyQt5.QtMultimedia import QCamera, QCameraInfo, QCameraViewfinderSettings
 from PyQt5.QtMultimediaWidgets import QCameraViewfinder
-from PyQt5.QtGui import QImage, QPixmap
 from bleak import BleakClient, BleakScanner
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
@@ -15,174 +15,180 @@ from bleak.backends.scanner import AdvertisementData
 
 from itertools import count, takewhile
 from typing import Iterator
+
 # ---- TARGET CAPTURE BOARD NAME ----
 TARGET_CAMERA_NAME = "UGREEN-25854"
 
-# ---- TARGET CAPTURE RESOLUTION ----
+# ---- TARGET CAPTURE RESOLUTION / FPS ----
 TARGET_CAPTURE_WIDTH = 1920
 TARGET_CAPTURE_HEIGHT = 1080
-
-# ---- TARGET CAPTURE FPS ----
 TARGET_CAPTURE_FPS = 60
 
 # ---- TARGET BLE DEVICE ----
 TARGET_BLE_NAME = "HID BLE Relay"
 
-# ---- NUS(UART) UUID ----
+# ---- HID Relay custom service UUIDs (must match firmware) ----
 HID_SERVICE_UUID = "597f1290-5b99-477d-9261-f0ed801fc566"
 HID_RX_CHAR_UUID = "597f1291-5b99-477d-9261-f0ed801fc566"  # Write
 HID_TX_CHAR_UUID = "597f1292-5b99-477d-9261-f0ed801fc566"  # Notify
 
-# ------------------------------------------------------
+BLE_RECONNECT_DELAY_S = 2.0
+ABS_COORD_MAX = 32767
+
+
 def sliced(data: bytes, n: int) -> Iterator[bytes]:
     return takewhile(len, (data[i : i + n] for i in count(0, n)))
 
+
 # ===================================================
-# 1. BLE Manager (Nordic UART Service)
+# 1. BLE Manager (HID Relay custom GATT service)
 # ===================================================
-class BleManager:
+class BleManager(QObject):
+    connected_changed = pyqtSignal(bool)
+
     def __init__(self):
+        super().__init__()
         self.client: BleakClient | None = None
         self.connected = False
         self.rx_char: BleakGATTCharacteristic | None = None
+        self._stop = False
 
-        
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
 
+    def _set_connected(self, value: bool):
+        if self.connected != value:
+            self.connected = value
+            self.connected_changed.emit(value)
+
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
-        while True:
+        while not self._stop:
             try:
                 self.loop.run_until_complete(self.connect_and_run())
             except Exception as e:
-                print(f"[BLE] Exeption : {e}")
-                self.loop.stop()
+                print(f"[BLE] Exception: {e}")
+            if self._stop:
                 break
+            time.sleep(BLE_RECONNECT_DELAY_S)
 
     async def connect_and_run(self):
-        # find and connect to NUS device, then register notify
-
-        # 1) Scan Name 
         def match_hid_device(device: BLEDevice, adv: AdvertisementData):
-            if device.name and TARGET_BLE_NAME in device.name:
+            if not device.name or TARGET_BLE_NAME not in device.name:
+                return False
+            if HID_SERVICE_UUID.lower() in [s.lower() for s in adv.service_uuids]:
                 print(f"[BLE] Found HID Device: {device.name}")
-                if HID_SERVICE_UUID.lower() in [s.lower() for s in adv.service_uuids]:
-                    return True
+                return True
             return False
 
-        print("[BLE] Scanning NUS device...")
+        print("[BLE] Scanning HID Relay device...")
         device = await BleakScanner.find_device_by_filter(match_hid_device, timeout=10.0)
-        # print(device)
 
         if device is None:
-            print("[BLE] NUS Device not found.")
-            return  # exit
+            print("[BLE] HID Relay not found, retrying...")
+            return
 
         def handle_disconnect(_: BleakClient):
             print("[BLE] Device disconnected.")
             for task in asyncio.all_tasks():
                 task.cancel()
 
-        # 2) connect to NUS device
         print(f"[BLE] Connecting to {device.address}...")
         async with BleakClient(device, disconnected_callback=handle_disconnect) as client:
             self.client = client
-            self.connected = True
             print("[BLE] Connected!")
 
-            # 3) Notify configuration (UART_TX_CHAR_UUID)
             await client.start_notify(HID_TX_CHAR_UUID, self.handle_rx)
-            print("[BLE] Notify on (waiting for data)")
 
-            # 4) Save RX characteristic for write
             nus_service = client.services.get_service(HID_SERVICE_UUID)
             self.rx_char = nus_service.get_characteristic(HID_RX_CHAR_UUID)
 
+            self._set_connected(True)
             try:
                 while True:
                     await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 pass
             finally:
-                print("[BLE] connection closed.")
-                self.connected = False
+                print("[BLE] Connection closed.")
+                self._set_connected(False)
                 self.client = None
+                self.rx_char = None
 
     def handle_rx(self, _: BleakGATTCharacteristic, data: bytearray):
-        print("[BLE] Recevied :", data)
+        print("[BLE] Received:", data)
 
     def send_data_sync(self, msg: str):
         if not self.connected or not self.rx_char:
-            print("[BLE] Not connected or RX characteristic not found.")
             return
-
-        future = asyncio.run_coroutine_threadsafe(
-            self._send_data(msg), self.loop
-        )
-        # e.g. result = future.result()
+        asyncio.run_coroutine_threadsafe(self._send_data(msg), self.loop)
 
     async def _send_data(self, msg: str):
-        # BLE GATT write (async)
         if not self.rx_char or not self.client:
-            print("[BLE] No client or RX characteristic.")
             return
-
         data = msg.encode()
         max_size = self.rx_char.max_write_without_response_size
-        # sliced write for BLE packet size limit
         for chunk in sliced(data, max_size):
-            await self.client.write_gatt_char(self.rx_char, chunk, response=False)
-        # print(f"[BLE] send complete : {msg}")
+            try:
+                await self.client.write_gatt_char(self.rx_char, chunk, response=False)
+            except Exception as e:
+                print(f"[BLE] write failed: {e}")
+                return
 
 
 # ===================================================
-# 2. PyQt5 GUI App (QtMultimedia Camera + BLE)
+# 2. PyQt5 GUI App
 # ===================================================
 class VideoApp(QWidget):
     def __init__(self, camera_index=0, ble_manager=None):
         super().__init__()
-        self.setWindowTitle(f"PyQt5 + QtMultimedia (Camera {camera_index})")
         self.ble_manager = ble_manager
-
-        # Init UI
+        self._mouse_buttons = 0  # bit0=left, bit1=right
+        self._update_title(False)
         self.setGeometry(100, 200, 960, 540)
 
-        # QCamera and QCameraViewfinder
         self.camera_viewfinder = QCameraViewfinder(self)
-        self.layout = QVBoxLayout()
-        self.layout.addWidget(self.camera_viewfinder)
+        layout = QVBoxLayout()
+        layout.addWidget(self.camera_viewfinder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.setLayout(layout)
+        # Required to receive mouseMoveEvent without a button held.
+        self.setMouseTracking(True)
+        self.camera_viewfinder.setMouseTracking(True)
 
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(0)
-        self.setLayout(self.layout)
-
-        # Select and configure camera
         cameras = QCameraInfo.availableCameras()
-        if not cameras:
-            print("No cameras available.")
-            sys.exit()
-
         viewfinder_settings = QCameraViewfinderSettings()
         viewfinder_settings.setResolution(TARGET_CAPTURE_WIDTH, TARGET_CAPTURE_HEIGHT)
-        viewfinder_settings.setMinimumFrameRate(TARGET_CAPTURE_FPS) 
-        viewfinder_settings.setMaximumFrameRate(TARGET_CAPTURE_FPS) 
+        viewfinder_settings.setMinimumFrameRate(TARGET_CAPTURE_FPS)
+        viewfinder_settings.setMaximumFrameRate(TARGET_CAPTURE_FPS)
 
         self.camera = QCamera(cameras[camera_index])
         self.camera.setViewfinder(self.camera_viewfinder)
-
         self.camera.setViewfinderSettings(viewfinder_settings)
         self.camera.start()
-        print("Available Resolution : ", self.camera.supportedViewfinderResolutions())
-        print("Current resolution: ", self.camera.viewfinderSettings().resolution())
+        print("Available Resolution:", self.camera.supportedViewfinderResolutions())
+        print("Current resolution:", self.camera.viewfinderSettings().resolution())
+
+        if self.ble_manager:
+            self.ble_manager.connected_changed.connect(self._update_title)
+
+    def _update_title(self, connected: bool):
+        status = "Connected" if connected else "Scanning..."
+        self.setWindowTitle(f"HID BLE Relay — {status}")
 
     def keyPressEvent(self, event):
-        # print(f"Key Pressed: {hex(event.key())}")
+        # The remote target's OS handles key auto-repeat itself; only relay
+        # the initial press so we don't spam the link.
+        if event.isAutoRepeat():
+            return
         if self.ble_manager:
             self.ble_manager.send_data_sync(f"KP:{hex(event.key())}")
 
     def keyReleaseEvent(self, event):
+        if event.isAutoRepeat():
+            return
         if self.ble_manager:
             self.ble_manager.send_data_sync(f"KR:{hex(event.key())}")
 
@@ -212,80 +218,101 @@ class VideoApp(QWidget):
             offset_x = (viewfinder_width - display_width) // 2
             offset_y = 0
 
-        return offset_x, offset_y, display_width, display_height, video_width, video_height
+        return offset_x, offset_y, display_width, display_height
+
+    def _normalized_pos(self, event):
+        x_off, y_off, width, height = self.get_video_display_rect()
+        if width <= 0 or height <= 0:
+            return 0, 0
+        nx = (event.pos().x() - x_off) / width
+        ny = (event.pos().y() - y_off) / height
+        nx = max(0.0, min(1.0, nx))
+        ny = max(0.0, min(1.0, ny))
+        return int(nx * ABS_COORD_MAX), int(ny * ABS_COORD_MAX)
 
     def mousePressEvent(self, event):
-        x_fs, y_fx, width, height, rw, rh = self.get_video_display_rect()
-
-        pos_x = int((event.pos().x() - x_fs)/width*32767)
-        pos_y = int((event.pos().y() - y_fx)/height*32767)
-        # print
-        # print(f"pos: {self.camera.geometry()} ")
-        # print(f"Mouse Pressed: {event.pos()} -> {widget_pos}")
+        if not self.ble_manager:
+            return
+        pos_x, pos_y = self._normalized_pos(event)
         if event.button() == Qt.LeftButton:
-            # print(f"Mouse Left Pressed: {event.pos()}")
-            if self.ble_manager:
-                self.ble_manager.send_data_sync(f"ML:{pos_x},{pos_y}")
+            self._mouse_buttons |= 0x1
+            self.ble_manager.send_data_sync(f"ML:{pos_x},{pos_y}")
         elif event.button() == Qt.RightButton:
-            # print(f"Mouse Right Pressed: {event.pos()}")
-            if self.ble_manager:
-                self.ble_manager.send_data_sync(f"MR:{pos_x},{pos_y}")
+            self._mouse_buttons |= 0x2
+            self.ble_manager.send_data_sync(f"MR:{pos_x},{pos_y}")
 
     def mouseReleaseEvent(self, event):
-        x_fs, y_fx, width, height,rw,rh = self.get_video_display_rect()
-
-        pos_x = int((event.pos().x() - x_fs)/width*32767)
-        pos_y = int((event.pos().y() - y_fx)/height*32767)
-
-        # print(f"Mouse Released: {event.pos()}")
+        if not self.ble_manager:
+            return
+        pos_x, pos_y = self._normalized_pos(event)
         if event.button() == Qt.LeftButton:
-            if self.ble_manager:
-                self.ble_manager.send_data_sync(f"MS:{pos_x},{pos_y}")
+            self._mouse_buttons &= ~0x1
+            self.ble_manager.send_data_sync(f"MS:{pos_x},{pos_y}")
         elif event.button() == Qt.RightButton:
-            if self.ble_manager:
-                self.ble_manager.send_data_sync(f"ME:{pos_x},{pos_y}")
+            self._mouse_buttons &= ~0x2
+            self.ble_manager.send_data_sync(f"ME:{pos_x},{pos_y}")
 
     def mouseMoveEvent(self, event):
-        x_fs, y_fx, width, height,rw,rh = self.get_video_display_rect()
+        if not self.ble_manager:
+            return
+        pos_x, pos_y = self._normalized_pos(event)
+        # Pick the verb based on which button is currently held so the
+        # firmware reports the right HID button bit during a drag.
+        if self._mouse_buttons & 0x1:
+            verb = "ML"
+        elif self._mouse_buttons & 0x2:
+            verb = "MR"
+        else:
+            verb = "MM"
+        self.ble_manager.send_data_sync(f"{verb}:{pos_x},{pos_y}")
 
-        pos_x = int((event.pos().x() - x_fs)/width*32767)
-        pos_y = int((event.pos().y() - y_fx)/height*32767)
-        # print(f"Mouse Moved: {event.pos()}")
-        if self.ble_manager:
-            self.ble_manager.send_data_sync(f"ML:{pos_x},{pos_y}")
+    def wheelEvent(self, event):
+        if not self.ble_manager:
+            return
+        # Qt's angleDelta is in 1/8 of a degree; one mouse-wheel detent ≈ 120.
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        wheel = delta // 120
+        if wheel == 0:
+            wheel = 1 if delta > 0 else -1
+        wheel = max(-127, min(127, wheel))
+        self.ble_manager.send_data_sync(f"WW:{wheel}")
 
 
 # ===================================================
-# 3. Main Function
+# 3. Main
 # ===================================================
 def main():
+    # On macOS, PyQt swaps Cmd<->Ctrl by default. That makes the host's
+    # physical Ctrl key arrive as Qt::Key_Meta, which the dongle then maps
+    # to the target's Cmd key — so Ctrl+C never reaches the target as Ctrl.
+    # Disable the swap.
+    QCoreApplication.setAttribute(Qt.AA_MacDontSwapCtrlAndMeta)
+
     app = QApplication(sys.argv)
 
-    # BLE manager
     ble_manager = BleManager()
-    selected_camera_index = 0
 
-    target_found = False
-    # Select the first available camera
     cameras = QCameraInfo.availableCameras()
+    if not cameras:
+        print("No cameras detected.")
+        sys.exit(1)
+
+    selected_camera_index = 0
+    target_found = False
     print("Available Cameras:")
     for idx, camera_info in enumerate(cameras):
         print(f"{idx}: {camera_info.description()}")
         if TARGET_CAMERA_NAME in camera_info.description():
             selected_camera_index = idx
             target_found = True
-            break
 
     if not target_found:
-        print(f"Target Camera {TARGET_CAMERA_NAME} not found. Selecting the first available camera.")
+        print(f"Target Camera {TARGET_CAMERA_NAME} not found. Selecting first available.")
+    print(f"Selected Camera: {selected_camera_index}: "
+          f"{cameras[selected_camera_index].description()}")
 
-    if not cameras:
-        print("No cameras detected.")
-        sys.exit(1)
-
-    print(f"Selected Camera: {selected_camera_index}: {cameras[selected_camera_index].description()}")
-
-    # Start the PyQt5 application
     window = VideoApp(selected_camera_index, ble_manager=ble_manager)
     window.show()
     sys.exit(app.exec_())
